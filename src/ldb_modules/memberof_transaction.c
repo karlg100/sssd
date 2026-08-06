@@ -81,6 +81,7 @@ struct tx_rename {
 
 struct tx_journal {
     bool dirty;
+    bool failed;
     bool migration_checked;
     bool migration_marker_exists;
     bool migration_complete;
@@ -1348,6 +1349,112 @@ static int tx_complete_noop(struct ldb_request *req)
     return ldb_module_done(req, NULL, NULL, LDB_SUCCESS);
 }
 
+enum tx_forward_operation {
+    TX_FORWARD_ADD,
+    TX_FORWARD_MODIFY,
+    TX_FORWARD_DELETE,
+    TX_FORWARD_RENAME
+};
+
+struct tx_forward_ctx {
+    struct ldb_module *module;
+    struct ldb_request *request;
+    struct tx_journal *journal;
+};
+
+static int tx_journal_error(struct tx_journal *journal, int ret)
+{
+    journal->failed = true;
+    return ret;
+}
+
+static int tx_forward_callback(struct ldb_request *req,
+                               struct ldb_reply *reply)
+{
+    struct tx_forward_ctx *ctx;
+    struct ldb_context *ldb;
+
+    ctx = talloc_get_type(req->context, struct tx_forward_ctx);
+    ldb = ldb_module_get_ctx(ctx->module);
+
+    if (reply == NULL) {
+        ctx->journal->failed = true;
+        return ldb_module_done(ctx->request, NULL, NULL,
+                               LDB_ERR_OPERATIONS_ERROR);
+    }
+    if (reply->error != LDB_SUCCESS) {
+        ctx->journal->failed = true;
+        return ldb_module_done(ctx->request, reply->controls,
+                               reply->response, reply->error);
+    }
+    if (reply->type != LDB_REPLY_DONE) {
+        ctx->journal->failed = true;
+        talloc_zfree(reply);
+        ldb_set_errstring(ldb, "Invalid reply type for a write request");
+        return ldb_module_done(ctx->request, NULL, NULL,
+                               LDB_ERR_OPERATIONS_ERROR);
+    }
+
+    return ldb_module_done(ctx->request, reply->controls,
+                           reply->response, LDB_SUCCESS);
+}
+
+static int tx_forward_request(struct ldb_module *module,
+                              struct ldb_request *req,
+                              struct tx_journal *journal,
+                              enum tx_forward_operation operation)
+{
+    struct tx_forward_ctx *ctx;
+    struct ldb_request *down_req;
+    struct ldb_context *ldb = ldb_module_get_ctx(module);
+    int ret;
+
+    ctx = talloc_zero(req, struct tx_forward_ctx);
+    if (ctx == NULL) {
+        return tx_journal_error(journal, LDB_ERR_OPERATIONS_ERROR);
+    }
+    ctx->module = module;
+    ctx->request = req;
+    ctx->journal = journal;
+
+    switch (operation) {
+    case TX_FORWARD_ADD:
+        ret = ldb_build_add_req(&down_req, ldb, ctx,
+                                req->op.add.message, req->controls,
+                                ctx, tx_forward_callback, req);
+        break;
+    case TX_FORWARD_MODIFY:
+        ret = ldb_build_mod_req(&down_req, ldb, ctx,
+                                req->op.mod.message, req->controls,
+                                ctx, tx_forward_callback, req);
+        break;
+    case TX_FORWARD_DELETE:
+        ret = ldb_build_del_req(&down_req, ldb, ctx,
+                                req->op.del.dn, req->controls,
+                                ctx, tx_forward_callback, req);
+        break;
+    case TX_FORWARD_RENAME:
+        ret = ldb_build_rename_req(&down_req, ldb, ctx,
+                                   req->op.rename.olddn,
+                                   req->op.rename.newdn,
+                                   req->controls,
+                                   ctx, tx_forward_callback, req);
+        break;
+    default:
+        ret = LDB_ERR_OPERATIONS_ERROR;
+        break;
+    }
+    if (ret != LDB_SUCCESS) {
+        return tx_journal_error(journal, ret);
+    }
+
+    ret = ldb_next_request(module, down_req);
+    if (ret != LDB_SUCCESS) {
+        return tx_journal_error(journal, ret);
+    }
+    return LDB_SUCCESS;
+}
+
 int memberof_tx_add(struct ldb_module *module, struct ldb_request *req)
 {
     struct tx_private *private_data;
@@ -1370,7 +1477,7 @@ int memberof_tx_add(struct ldb_module *module, struct ldb_request *req)
         if (dn_string != NULL && strcmp(dn_string, TX_REBUILD_DN) == 0) {
             ret = tx_mark_dirty(module, journal);
             if (ret != LDB_SUCCESS) {
-                return ret;
+                return tx_journal_error(journal, ret);
             }
             return tx_complete_noop(req);
         }
@@ -1378,44 +1485,44 @@ int memberof_tx_add(struct ldb_module *module, struct ldb_request *req)
     }
     ret = tx_snapshot_ensure(module, journal);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
     ret = tx_check_readonly(module, req->op.add.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     ret = tx_validate_members(module, req->op.add.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
     identity = tx_message_is_identity(req->op.add.message);
     if (identity) {
         ret = tx_mark_dirty(module, journal);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
         ret = tx_record_request_ghosts(journal, req, true);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
     }
 
     key = tx_dn_key(req->op.add.message->dn);
     if (key == NULL) {
-        return LDB_ERR_INVALID_DN_SYNTAX;
+        return tx_journal_error(journal, LDB_ERR_INVALID_DN_SYNTAX);
     }
     ret = tx_set_remove(&journal->deleted_dns, key);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     ret = tx_snapshot_add(journal, req->op.add.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
-    return ldb_next_request(module, req);
+    return tx_forward_request(module, req, journal, TX_FORWARD_ADD);
 }
 
 int memberof_tx_modify(struct ldb_module *module, struct ldb_request *req)
@@ -1442,11 +1549,11 @@ int memberof_tx_modify(struct ldb_module *module, struct ldb_request *req)
 
     ret = tx_check_readonly(module, req->op.mod.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     ret = tx_validate_members(module, req->op.mod.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
     relevant = tx_modify_affects_graph(req->op.mod.message);
@@ -1457,7 +1564,7 @@ int memberof_tx_modify(struct ldb_module *module, struct ldb_request *req)
 
     ret = tx_snapshot_ensure(module, journal);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     identity = tx_snapshot_lookup(journal, req->op.mod.message->dn);
     if (identity == NULL) {
@@ -1467,7 +1574,7 @@ int memberof_tx_modify(struct ldb_module *module, struct ldb_request *req)
 
     ret = tx_load_migration_state(module, private_data, journal);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     changes_graph = true;
     if (journal->migration_complete) {
@@ -1477,27 +1584,28 @@ int memberof_tx_modify(struct ldb_module *module, struct ldb_request *req)
 
     ret = tx_snapshot_modify(journal, req->op.mod.message);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     is_identity = tx_message_is_identity(identity);
     if (!was_identity && !is_identity) {
-        return ldb_next_request(module, req);
+        return tx_forward_request(module, req, journal,
+                                  TX_FORWARD_MODIFY);
     }
 
     ret = tx_record_request_ghosts(journal, req, false);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
     relevant = !journal->migration_complete || changes_graph;
     if (relevant) {
         ret = tx_mark_dirty(module, journal);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
     }
 
-    return ldb_next_request(module, req);
+    return tx_forward_request(module, req, journal, TX_FORWARD_MODIFY);
 }
 
 int memberof_tx_delete(struct ldb_module *module, struct ldb_request *req)
@@ -1521,7 +1629,7 @@ int memberof_tx_delete(struct ldb_module *module, struct ldb_request *req)
     }
     ret = tx_snapshot_ensure(module, journal);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     identity = tx_snapshot_lookup(journal, req->op.del.dn);
     if (identity == NULL) {
@@ -1532,23 +1640,23 @@ int memberof_tx_delete(struct ldb_module *module, struct ldb_request *req)
     if (is_identity) {
         ret = tx_mark_dirty(module, journal);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
         key = tx_dn_key(req->op.del.dn);
         if (key == NULL) {
-            return LDB_ERR_INVALID_DN_SYNTAX;
+            return tx_journal_error(journal, LDB_ERR_INVALID_DN_SYNTAX);
         }
         ret = tx_set_add(&journal->deleted_dns, key, key);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
     }
     ret = tx_snapshot_remove(journal, req->op.del.dn);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
-    return ldb_next_request(module, req);
+    return tx_forward_request(module, req, journal, TX_FORWARD_DELETE);
 }
 
 int memberof_tx_rename(struct ldb_module *module, struct ldb_request *req)
@@ -1573,7 +1681,7 @@ int memberof_tx_rename(struct ldb_module *module, struct ldb_request *req)
     }
     ret = tx_snapshot_ensure(module, journal);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     identity = tx_snapshot_lookup(journal, req->op.rename.olddn);
     if (identity == NULL) {
@@ -1584,29 +1692,29 @@ int memberof_tx_rename(struct ldb_module *module, struct ldb_request *req)
     if (is_identity) {
         ret = tx_mark_dirty(module, journal);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
         ret = tx_record_rename(journal, req->op.rename.olddn,
                                req->op.rename.newdn);
         if (ret != LDB_SUCCESS) {
-            return ret;
+            return tx_journal_error(journal, ret);
         }
     }
     new_key = tx_dn_key(req->op.rename.newdn);
     if (new_key == NULL) {
-        return LDB_ERR_INVALID_DN_SYNTAX;
+        return tx_journal_error(journal, LDB_ERR_INVALID_DN_SYNTAX);
     }
     ret = tx_set_remove(&journal->deleted_dns, new_key);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
     ret = tx_snapshot_rename(journal, req->op.rename.olddn,
                              req->op.rename.newdn);
     if (ret != LDB_SUCCESS) {
-        return ret;
+        return tx_journal_error(journal, ret);
     }
 
-    return ldb_next_request(module, req);
+    return tx_forward_request(module, req, journal, TX_FORWARD_RENAME);
 }
 
 int memberof_tx_start(struct ldb_module *module)
@@ -1654,6 +1762,12 @@ int memberof_tx_prepare_commit(struct ldb_module *module)
     if (journal == NULL) {
         return LDB_ERR_OPERATIONS_ERROR;
     }
+    if (journal->failed) {
+        ldb_set_errstring(ldb_module_get_ctx(module),
+                          "Cannot commit after a failed memberof write");
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
     if (journal->dirty) {
         private_data->flushing = true;
         ret = tx_graph_flush(module, journal);
