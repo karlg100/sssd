@@ -4826,7 +4826,7 @@ START_TEST(test_transactional_memberof_ghost_writes)
 }
 END_TEST
 
-START_TEST(test_transactional_memberof_failed_write_aborts_commit)
+START_TEST(test_transactional_memberof_failed_writes_preserve_journal)
 {
     static const char *group_attrs[] = { SYSDB_MEMBER, NULL };
     struct sysdb_test_ctx *test_ctx;
@@ -4839,6 +4839,7 @@ START_TEST(test_transactional_memberof_failed_write_aborts_commit)
     const char *present_user;
     const char *missing_user;
     const char *group;
+    const char *missing_dn_str;
     const char *present_dn_str;
     int lret;
     errno_t ret;
@@ -4879,8 +4880,9 @@ START_TEST(test_transactional_memberof_failed_write_aborts_commit)
     ck_assert_msg(present_dn != NULL && missing_dn != NULL && group_dn != NULL,
                   "Could not create failed-write DNs");
     present_dn_str = ldb_dn_get_linearized(present_dn);
-    ck_assert_msg(present_dn_str != NULL,
-                  "Could not linearize the retained member DN");
+    missing_dn_str = ldb_dn_get_linearized(missing_dn);
+    ck_assert_msg(present_dn_str != NULL && missing_dn_str != NULL,
+                  "Could not linearize the member DNs");
 
     lret = ldb_transaction_start(ldb);
     ck_assert_int_eq(lret, LDB_SUCCESS);
@@ -4889,15 +4891,29 @@ START_TEST(test_transactional_memberof_failed_write_aborts_commit)
                                   LDB_FLAG_MOD_DELETE);
     ck_assert_msg(lret != LDB_SUCCESS,
                   "Deleting an absent member unexpectedly succeeded");
-    lret = ldb_transaction_commit(ldb);
+
+    member[0] = present_dn;
+    lret = test_tx_modify_members(test_ctx, ldb, group_dn, member, 1,
+                                  LDB_FLAG_MOD_ADD);
     ck_assert_msg(lret != LDB_SUCCESS,
-                  "A transaction with a failed memberof write committed");
+                  "Adding a duplicate member unexpectedly succeeded");
+
+    member[0] = missing_dn;
+    lret = test_tx_modify_members(test_ctx, ldb, group_dn, member, 1,
+                                  LDB_FLAG_MOD_ADD);
+    ck_assert_int_eq(lret, LDB_SUCCESS);
+
+    lret = ldb_transaction_commit(ldb);
+    ck_assert_msg(lret == LDB_SUCCESS,
+                  "Expected write errors poisoned a valid transaction");
 
     ret = sysdb_search_group_by_name(test_ctx, test_ctx->domain, group,
                                      group_attrs, &msg);
     ck_assert_int_eq(ret, EOK);
     ck_assert_msg(test_message_has_value(msg, SYSDB_MEMBER, present_dn_str),
-                  "Failed transaction removed the existing member");
+                  "Failed delete removed the existing member");
+    ck_assert_msg(test_message_has_value(msg, SYSDB_MEMBER, missing_dn_str),
+                  "Successful write after expected failures was not staged");
 
     talloc_free(test_ctx);
 }
@@ -9253,7 +9269,7 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_transactional,
                    test_transactional_memberof_ghost_writes);
     tcase_add_test(tc_transactional,
-                   test_transactional_memberof_failed_write_aborts_commit);
+                   test_transactional_memberof_failed_writes_preserve_journal);
     tcase_add_test(tc_transactional,
                    test_transactional_memberof_large_replace);
     suite_add_tcase(s, tc_transactional);
