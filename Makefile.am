@@ -507,6 +507,11 @@ dist_noinst_DATA = \
     src/config/testconfigs/sssd-enabled-option.conf \
     src/config/etc/sssd.api.d/crash_test_dummy \
     contrib/ci/README.md \
+    contrib/memberof-watchdog-reproducer/README.md \
+    contrib/memberof-watchdog-reproducer/setup-disposable-ldap.sh \
+    contrib/memberof-watchdog-reproducer/run-container-test.sh \
+    contrib/memberof-watchdog-reproducer/Containerfile \
+    contrib/memberof-watchdog-reproducer/run-container.sh \
     contrib/ci/sssd.supp \
     contrib/ci/sssd.debian.supp \
     contrib/gdbinit \

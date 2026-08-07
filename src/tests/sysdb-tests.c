@@ -27,6 +27,7 @@
 #include <popt.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include "util/util.h"
 #include "util/crypto/sss_crypto.h"
@@ -55,6 +56,21 @@
 #define MBO_USER_BASE 27500
 #define MBO_GROUP_BASE 28500
 #define NUM_GHOSTS 10
+
+/*
+ * Synthetic data set for the memberOf watchdog reproducer.  The values are
+ * 150% of the dimensions observed in the production cache.  Keeping the
+ * input entirely synthetic makes it suitable for attachment to a public
+ * issue while still providing ample margin over the default 30 second
+ * watchdog deadline.
+ */
+#define WATCHDOG_REPRO_CHILDREN 708
+#define WATCHDOG_REPRO_DIRECT_PARENTS 143
+#define WATCHDOG_REPRO_ANCESTORS 20
+#define WATCHDOG_REPRO_TARGET_GID 610000
+#define WATCHDOG_REPRO_PEER_GID_BASE 611000
+#define WATCHDOG_REPRO_ANCESTOR_GID_BASE 612000
+#define WATCHDOG_REPRO_CHILD_UID_BASE 620000
 
 #define TEST_AUTOFS_MAP_BASE 29500
 
@@ -3974,6 +3990,374 @@ START_TEST(test_sysdb_get_real_name)
                                               realname, str);
 }
 END_TEST
+
+/*
+ * Build an intentionally high-fanout, but entirely synthetic, memberOf
+ * graph. The group named repro-stale-group has no parents and 708 direct user
+ * members. Each user also has 142 other direct parent groups and 20 inherited
+ * parent groups. Storing repro-incoming-group with the stale group's GID
+ * takes the legacy same-GID delete path and rebuilds 708 reverse membership
+ * sets.
+ *
+ * Do not replace this with ldbadd or an LDIF import. The installed memberOf
+ * module must create the materialized memberOf attributes and indexes exactly
+ * as it does in normal operation.
+ */
+static int watchdog_repro_replace_members(TALLOC_CTX *mem_ctx,
+                                          struct ldb_context *ldb,
+                                          struct ldb_dn *group_dn,
+                                          struct ldb_dn **members,
+                                          size_t num_members)
+{
+    struct ldb_message *msg;
+    struct ldb_message_element *el;
+    const char *value;
+    bool in_transaction = false;
+    size_t i;
+    int ret;
+
+    msg = ldb_msg_new(mem_ctx);
+    if (msg == NULL) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    msg->dn = ldb_dn_copy(msg, group_dn);
+    if (msg->dn == NULL) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    ret = ldb_msg_add_empty(msg, SYSDB_MEMBER, LDB_FLAG_MOD_REPLACE, &el);
+    if (ret != LDB_SUCCESS) {
+        return ret;
+    }
+
+    el->values = talloc_zero_array(msg, struct ldb_val, num_members);
+    if (el->values == NULL) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    for (i = 0; i < num_members; i++) {
+        value = ldb_dn_get_linearized(members[i]);
+        if (value == NULL) {
+            return LDB_ERR_INVALID_DN_SYNTAX;
+        }
+
+        el->values[i].data = (uint8_t *)talloc_strdup(el->values, value);
+        if (el->values[i].data == NULL) {
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+        el->values[i].length = strlen(value);
+    }
+    el->num_values = num_members;
+
+    ret = ldb_transaction_start(ldb);
+    if (ret != LDB_SUCCESS) {
+        return ret;
+    }
+    in_transaction = true;
+
+    ret = ldb_modify(ldb, msg);
+    if (ret != LDB_SUCCESS) {
+        goto done;
+    }
+
+    ret = ldb_transaction_commit(ldb);
+    if (ret == LDB_SUCCESS) {
+        in_transaction = false;
+    }
+
+done:
+    if (in_transaction) {
+        ldb_transaction_cancel(ldb);
+    }
+    return ret;
+}
+
+static errno_t watchdog_repro_store_group(struct sss_domain_info *domain,
+                                          const char *name,
+                                          gid_t gid)
+{
+    errno_t ret;
+
+    ret = sysdb_store_group(domain, name, gid, NULL, 0, 0);
+    if (ret != EOK) {
+        fprintf(stderr, "Could not store synthetic group [%s]: %d [%s]\n",
+                name, ret, sss_strerror(ret));
+    }
+    return ret;
+}
+
+static errno_t watchdog_repro_populate(struct sysdb_test_ctx *test_ctx)
+{
+    static const char *group_attrs[] = {
+        SYSDB_MEMBER, SYSDB_MEMBEROF, SYSDB_GHOST, NULL
+    };
+    static const char *user_attrs[] = { SYSDB_MEMBEROF, NULL };
+    struct ldb_context *ldb = test_ctx->sysdb->ldb;
+    struct ldb_dn **child_dns = NULL;
+    struct ldb_dn **peer_dns = NULL;
+    struct ldb_dn **ancestor_dns = NULL;
+    struct ldb_dn *target_dn;
+    struct ldb_message_element *el;
+    struct ldb_message *msg = NULL;
+    TALLOC_CTX *tmp_ctx;
+    const char *target_name;
+    char *child_name;
+    char *name;
+    size_t i;
+    int lret;
+    errno_t ret;
+
+    tmp_ctx = talloc_new(test_ctx);
+    if (tmp_ctx == NULL) {
+        return ENOMEM;
+    }
+
+    child_dns = talloc_zero_array(tmp_ctx, struct ldb_dn *,
+                                  WATCHDOG_REPRO_CHILDREN);
+    peer_dns = talloc_zero_array(tmp_ctx, struct ldb_dn *,
+                                 WATCHDOG_REPRO_DIRECT_PARENTS - 1);
+    ancestor_dns = talloc_zero_array(tmp_ctx, struct ldb_dn *,
+                                     WATCHDOG_REPRO_ANCESTORS);
+    if (child_dns == NULL || peer_dns == NULL || ancestor_dns == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    for (i = 0; i < WATCHDOG_REPRO_CHILDREN; i++) {
+        name = test_asprintf_fqname(tmp_ctx, test_ctx->domain,
+                                    "repro-child-%04zu", i);
+        if (name == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        ret = sysdb_store_user(test_ctx->domain, name, NULL,
+                               WATCHDOG_REPRO_CHILD_UID_BASE + i, 0,
+                               "Synthetic memberOf reproducer user",
+                               "/nonexistent", "/sbin/nologin", NULL,
+                               NULL, NULL, -1, 0);
+        if (ret != EOK) {
+            fprintf(stderr, "Could not store synthetic user [%s]: %d [%s]\n",
+                    name, ret, sss_strerror(ret));
+            goto done;
+        }
+
+        child_dns[i] = sysdb_user_dn(child_dns, test_ctx->domain, name);
+        if (child_dns[i] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    target_name = test_asprintf_fqname(tmp_ctx, test_ctx->domain,
+                                       "repro-stale-group");
+    if (target_name == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    ret = watchdog_repro_store_group(test_ctx->domain, target_name,
+                                     WATCHDOG_REPRO_TARGET_GID);
+    if (ret != EOK) {
+        goto done;
+    }
+    target_dn = sysdb_group_dn(tmp_ctx, test_ctx->domain, target_name);
+    if (target_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    for (i = 0; i < WATCHDOG_REPRO_DIRECT_PARENTS - 1; i++) {
+        name = test_asprintf_fqname(tmp_ctx, test_ctx->domain,
+                                    "repro-peer-parent-%03zu", i);
+        if (name == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        ret = watchdog_repro_store_group(test_ctx->domain, name,
+                                         WATCHDOG_REPRO_PEER_GID_BASE + i);
+        if (ret != EOK) {
+            goto done;
+        }
+        peer_dns[i] = sysdb_group_dn(peer_dns, test_ctx->domain, name);
+        if (peer_dns[i] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    for (i = 0; i < WATCHDOG_REPRO_ANCESTORS; i++) {
+        name = test_asprintf_fqname(tmp_ctx, test_ctx->domain,
+                                    "repro-ancestor-%03zu", i);
+        if (name == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        ret = watchdog_repro_store_group(test_ctx->domain, name,
+                                         WATCHDOG_REPRO_ANCESTOR_GID_BASE + i);
+        if (ret != EOK) {
+            goto done;
+        }
+        ancestor_dns[i] = sysdb_group_dn(ancestor_dns, test_ctx->domain,
+                                         name);
+        if (ancestor_dns[i] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    lret = watchdog_repro_replace_members(tmp_ctx, ldb, target_dn, child_dns,
+                                          WATCHDOG_REPRO_CHILDREN);
+    if (lret != LDB_SUCCESS) {
+        fprintf(stderr, "Could not populate the stale group: %d\n", lret);
+        ret = EIO;
+        goto done;
+    }
+
+    for (i = 0; i < WATCHDOG_REPRO_DIRECT_PARENTS - 1; i++) {
+        TALLOC_CTX *op_ctx = talloc_new(tmp_ctx);
+
+        if (op_ctx == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        lret = watchdog_repro_replace_members(op_ctx, ldb, peer_dns[i],
+                                              child_dns,
+                                              WATCHDOG_REPRO_CHILDREN);
+        talloc_free(op_ctx);
+        if (lret != LDB_SUCCESS) {
+            fprintf(stderr, "Could not populate peer parent %zu: %d\n",
+                    i, lret);
+            ret = EIO;
+            goto done;
+        }
+    }
+
+    for (i = 0; i < WATCHDOG_REPRO_ANCESTORS; i++) {
+        TALLOC_CTX *op_ctx = talloc_new(tmp_ctx);
+
+        if (op_ctx == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        lret = watchdog_repro_replace_members(op_ctx, ldb, ancestor_dns[i],
+                                              &peer_dns[i], 1);
+        talloc_free(op_ctx);
+        if (lret != LDB_SUCCESS) {
+            fprintf(stderr, "Could not populate ancestor %zu: %d\n", i,
+                    lret);
+            ret = EIO;
+            goto done;
+        }
+    }
+
+    ret = sysdb_search_group_by_name(tmp_ctx, test_ctx->domain, target_name,
+                                     group_attrs, &msg);
+    if (ret != EOK) {
+        goto done;
+    }
+    el = ldb_msg_find_element(msg, SYSDB_MEMBER);
+    if (el == NULL || el->num_values != WATCHDOG_REPRO_CHILDREN
+        || ldb_msg_find_element(msg, SYSDB_MEMBEROF) != NULL
+        || ldb_msg_find_element(msg, SYSDB_GHOST) != NULL) {
+        fprintf(stderr, "Synthetic stale group does not have the expected "
+                "memberOf shape\n");
+        ret = EIO;
+        goto done;
+    }
+    talloc_zfree(msg);
+
+    child_name = test_asprintf_fqname(tmp_ctx, test_ctx->domain,
+                                      "repro-child-0000");
+    if (child_name == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    ret = sysdb_search_user_by_name(tmp_ctx, test_ctx->domain, child_name,
+                                    user_attrs, &msg);
+    if (ret != EOK) {
+        goto done;
+    }
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    if (el == NULL || el->num_values != WATCHDOG_REPRO_DIRECT_PARENTS
+                                      + WATCHDOG_REPRO_ANCESTORS) {
+        fprintf(stderr, "Synthetic child does not have the expected "
+                "reverse-membership count\n");
+        ret = EIO;
+        goto done;
+    }
+
+    ret = EOK;
+
+done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
+static uint64_t watchdog_repro_milliseconds(const struct timespec *start,
+                                             const struct timespec *end)
+{
+    time_t seconds = end->tv_sec - start->tv_sec;
+    long nanoseconds = end->tv_nsec - start->tv_nsec;
+
+    if (nanoseconds < 0) {
+        seconds--;
+        nanoseconds += 1000000000L;
+    }
+
+    return ((uint64_t)seconds * 1000) + ((uint64_t)nanoseconds / 1000000);
+}
+
+static errno_t run_memberof_watchdog_reproducer(bool run_trigger)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct timespec start;
+    struct timespec end;
+    char *incoming_name;
+    errno_t ret;
+
+    test_dom_suite_cleanup(TESTS_PATH, TEST_CONF_FILE, "FILES");
+
+    ret = setup_sysdb_tests(&test_ctx);
+    if (ret != EOK) {
+        return ret;
+    }
+
+    ret = watchdog_repro_populate(test_ctx);
+    if (ret != EOK || !run_trigger) {
+        goto done;
+    }
+
+    incoming_name = test_asprintf_fqname(test_ctx, test_ctx->domain,
+                                         "repro-incoming-group");
+    if (incoming_name == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        ret = errno;
+        goto done;
+    }
+    ret = sysdb_store_group(test_ctx->domain, incoming_name,
+                            WATCHDOG_REPRO_TARGET_GID, NULL, 0, 0);
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0 && ret == EOK) {
+        ret = errno;
+    }
+    if (ret == EOK) {
+        printf("same-GID delete/re-add completed in %llu ms\n",
+               (unsigned long long)watchdog_repro_milliseconds(&start, &end));
+    }
+
+done:
+    if (ret == EOK) {
+        printf("Synthetic cache retained at %s/cache_FILES.ldb\n", TESTS_PATH);
+        printf("Synthetic timestamp database retained at %s/timestamps_FILES.ldb\n",
+               TESTS_PATH);
+    }
+    talloc_free(test_ctx);
+    return ret;
+}
 
 START_TEST(test_group_rename)
 {
@@ -8302,6 +8686,8 @@ int main(int argc, const char *argv[]) {
     poptContext pc;
     int failure_count;
     int no_cleanup = 0;
+    int generate_memberof_watchdog_cache = 0;
+    int run_memberof_watchdog_trigger = 0;
     Suite *sysdb_suite;
     SRunner *sr;
 
@@ -8310,6 +8696,12 @@ int main(int argc, const char *argv[]) {
         SSSD_DEBUG_OPTS
         {"no-cleanup", 'n', POPT_ARG_NONE, &no_cleanup, 0,
          _("Do not delete the test database after a test run"), NULL },
+        {"generate-memberof-watchdog-cache", 0, POPT_ARG_NONE,
+         &generate_memberof_watchdog_cache, 0,
+         _("Generate a synthetic same-GID memberOf watchdog cache"), NULL },
+        {"run-memberof-watchdog-trigger", 0, POPT_ARG_NONE,
+         &run_memberof_watchdog_trigger, 0,
+         _("Generate the synthetic cache and run its same-GID trigger"), NULL },
         POPT_TABLEEND
     };
 
@@ -8337,6 +8729,17 @@ int main(int argc, const char *argv[]) {
 
     tests_set_cwd();
     talloc_enable_null_tracking();
+
+    if (generate_memberof_watchdog_cache || run_memberof_watchdog_trigger) {
+        if (generate_memberof_watchdog_cache && run_memberof_watchdog_trigger) {
+            fprintf(stderr, "Choose either --generate-memberof-watchdog-cache "
+                    "or --run-memberof-watchdog-trigger.\n");
+            return EXIT_FAILURE;
+        }
+
+        opt = run_memberof_watchdog_reproducer(run_memberof_watchdog_trigger);
+        return opt == EOK ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
 
     test_dom_suite_cleanup(TESTS_PATH, TEST_CONF_FILE, "FILES");
 

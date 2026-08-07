@@ -1,0 +1,24 @@
+FROM fedora:43
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+WORKDIR /src
+COPY . /src
+
+RUN dnf -y install rpm-build python3 && \
+    mapfile -t build_deps < <(sed -n 's/^BuildRequires:[[:space:]]*//p' \
+        contrib/sssd.spec.in) && \
+    dnf -y install --setopt=install_weak_deps=False "${build_deps[@]}" && \
+    dnf -y install --setopt=install_weak_deps=False \
+        openldap-clients openldap-servers sssd-client && \
+    dnf clean all && \
+    (getent passwd sssd >/dev/null || useradd --system --shell /sbin/nologin sssd) && \
+    autoreconf -fi && \
+    ./configure --with-test-dir=/work/test && \
+    make -j"$(nproc)" && \
+    make ldb_mod_test_dir sysdb-tests && \
+    make install && \
+    ldconfig && \
+    chmod 0755 contrib/memberof-watchdog-reproducer/*.sh
+
+ENTRYPOINT ["/src/contrib/memberof-watchdog-reproducer/run-container-test.sh"]
