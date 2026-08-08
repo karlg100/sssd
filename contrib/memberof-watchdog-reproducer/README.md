@@ -35,19 +35,29 @@ seconds, well beyond the default watchdog deadline of three missed
 - `setup-disposable-ldap.sh` creates and starts a local OpenLDAP server with
   only the synthetic group required to trigger the collision.
 - `run-container-test.sh` is the in-container test driver. It generates the
-  LDB, configures SSSD, runs an NSS request, and asserts that stock SSSD logs
-  a watchdog termination.
+  LDB, configures SSSD, runs an NSS request, and checks the result against the
+  selected affected-build or fixed-build expectation.
 - `Containerfile` builds an otherwise stock SSSD checkout containing only the
   reproducer change, then executes the driver.
 - `run-container.sh` is the host-side Docker wrapper.
 
 ## Run in a disposable container
 
+The host needs a Docker-compatible container runtime, network access to pull
+the Fedora base image and packages, and several GB of free disk space for the
+image and full SSSD build. The first run builds SSSD from the current checkout
+and can take several minutes, depending on the host.
+
+### Confirm an affected build
+
 From the SSSD source root, run:
 
 ```sh
 bash contrib/memberof-watchdog-reproducer/run-container.sh
 ```
+
+This is equivalent to setting `MEMBEROF_EXPECT_WATCHDOG=yes`. The test passes
+only when SSSD logs a watchdog termination.
 
 The wrapper builds a Fedora 43 image from the current checkout. It
 installs build dependencies, compiles and installs SSSD, creates a local LDAP
@@ -63,9 +73,39 @@ Validation of this fixture on 2026-08-06 with the stock source build in the
 container produced the same-GID collision at 13:56:40 and the watchdog
 termination at 13:57:11 (31 seconds later).
 
-The container is removed on exit. To retain `/work/result` from a failed run,
-override `CONTAINER_RUNTIME` with a compatible runtime and invoke the
-Containerfile directly without `--rm`.
+### Validate a candidate fix
+
+Apply the reproducer changes to the checkout containing the candidate fix,
+then run:
+
+```sh
+MEMBEROF_EXPECT_WATCHDOG=no \
+  bash contrib/memberof-watchdog-reproducer/run-container.sh
+```
+
+In this mode the test passes only when the watchdog message is absent and the
+NSS lookup exits successfully. The reproducer does not depend on a particular
+fix; it must simply be present in the source checkout that the container
+builds.
+
+Every completed run prints the expected and observed watchdog state, the
+`getent` exit status, the pass/fail result, and the in-container result path.
+Exit status 0 means the selected expectation was met; exit status 1 means it
+was not.
+
+### Retain logs and results
+
+The container is removed on exit. Bind-mount the result directory to retain
+`status.txt`, the generator output, NSS output, LDAP fixture, and SSSD logs:
+
+```sh
+MEMBEROF_REPRO_RESULT_DIR="$PWD/memberof-repro-result" \
+  bash contrib/memberof-watchdog-reproducer/run-container.sh
+```
+
+Use a new or empty result directory for each run. `CONTAINER_RUNTIME` may be
+set to the name of a compatible runtime if `docker` is not the desired
+command.
 
 ## Generate only the cache
 
@@ -92,8 +132,9 @@ reproduction on Fedora.
 same-GID operation in-process. It cannot itself produce a watchdog event,
 because `sysdb-tests` is not supervised by `sssd_be`.
 
-## Suggested GitHub issue attachments
+## Sharing the reproducer in a GitHub issue
 
-Attach the source diff adding the two `sysdb-tests` options, this directory,
-and SHA-256 hashes of any generated LDBs. The LDB binary is optional: maintainers
-should normally regenerate it from the supplied source and scripts.
+Link to the immutable commit containing the `sysdb-tests` generator and this
+directory. Maintainers should generate the cache with the supplied source and
+scripts. Do not attach a generated LDB: it is tied to the SSSD/libldb build and
+`memberOf` module that created it and is not a portable reproducer artifact.

@@ -6,6 +6,7 @@ set -euo pipefail
 source_root=${SOURCE_ROOT:-/src}
 result_dir=${RESULT_DIR:-/work/result}
 test_dir=${TEST_DIR:-/work/test}
+expect_watchdog=${MEMBEROF_EXPECT_WATCHDOG:-yes}
 ldap_dir="$result_dir/ldap"
 sssd_log="$result_dir/sssd.stderr.log"
 sssd_prefix=/usr/local
@@ -13,6 +14,14 @@ sssd_state_dir="$sssd_prefix/var/lib/sss"
 sssd_log_dir="$sssd_prefix/var/log/sssd"
 sssd_config_dir="$sssd_prefix/etc/sssd"
 sssd_pid=''
+
+case "$expect_watchdog" in
+yes|no) ;;
+*)
+    echo "MEMBEROF_EXPECT_WATCHDOG must be 'yes' or 'no'" >&2
+    exit 2
+    ;;
+esac
 
 cleanup() {
     test -z "$sssd_pid" || kill "$sssd_pid" 2>/dev/null || true
@@ -104,10 +113,43 @@ timeout 120 getent -s sss group repro-incoming-group@FILES \
     > "$result_dir/getent.out" 2> "$result_dir/getent.err"
 getent_status=$?
 set -e
-printf 'getent_status=%s\n' "$getent_status" > "$result_dir/status.txt"
 
 sleep 2
 cat "$sssd_log" /var/log/sssd/*.log 2>/dev/null > "$result_dir/sssd.all.log" || true
-grep -q 'was terminated by own WATCHDOG' "$result_dir/sssd.all.log"
+watchdog_observed=no
+if grep -q 'was terminated by own WATCHDOG' "$result_dir/sssd.all.log"; then
+    watchdog_observed=yes
+fi
 
-printf 'watchdog_reproduced=yes\n' >> "$result_dir/status.txt"
+test_result=pass
+failure_reason=''
+if [[ "$expect_watchdog" = yes && "$watchdog_observed" != yes ]]; then
+    test_result=fail
+    failure_reason='expected a watchdog termination but none was logged'
+elif [[ "$expect_watchdog" = no && "$watchdog_observed" = yes ]]; then
+    test_result=fail
+    failure_reason='expected no watchdog termination but one was logged'
+elif [[ "$expect_watchdog" = no && "$getent_status" -ne 0 ]]; then
+    test_result=fail
+    failure_reason="expected a successful NSS lookup but getent exited $getent_status"
+fi
+
+cat > "$result_dir/status.txt" <<EOF
+expect_watchdog=$expect_watchdog
+watchdog_observed=$watchdog_observed
+watchdog_reproduced=$watchdog_observed
+getent_status=$getent_status
+test_result=$test_result
+EOF
+
+printf '\nmemberOf watchdog reproducer result\n'
+printf '  expected watchdog: %s\n' "$expect_watchdog"
+printf '  observed watchdog: %s\n' "$watchdog_observed"
+printf '  getent status:     %s\n' "$getent_status"
+printf '  test result:       %s\n' "$test_result"
+printf '  result files:      %s\n' "$result_dir"
+
+if [[ "$test_result" != pass ]]; then
+    echo "  reason:            $failure_reason" >&2
+    exit 1
+fi
